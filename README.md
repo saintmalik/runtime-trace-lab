@@ -1,6 +1,6 @@
 # runtime-trace-lab
 
-Companion lab for [Runtime Trace: signed image, dishonest process](https://blog.saintmalik.me/runtime-trace-process-attestation/)
+Companion lab for [Runtime Trace attestation: signed image, dishonest process](https://blog.saintmalik.me/runtime-trace-process-attestation/)
 
 Prove Cosign **image signature PASS** + **Runtime Trace policy PASS/FAIL**.
 
