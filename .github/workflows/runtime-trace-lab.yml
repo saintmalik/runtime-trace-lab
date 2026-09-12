@@ -1,0 +1,196 @@
+# Prove: image signature PASS on clean+dirty; Runtime Trace policy PASS only on clean.
+# Dirty = confused CI codegen (go install typosquat). Trace from tetra getevents JSON (gRPC),
+# not the rate-limited /var/log/tetragon/tetragon.log file sink.
+name: Runtime Trace lab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+env:
+  TRACE_TYPE: https://in-toto.io/attestation/runtime-trace/v0.1
+  # gRPC stream capture — file export drops process_exec under kprobe flood/rate limits.
+  TETRAGON_EXPORT: /tmp/tetragon-trace.jsonl
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [clean, dirty]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Record job start
+        id: window
+        run: echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Start Tetragon
+        uses: lizrice/tetragon-ci/.github/actions/tetragon-setup@5fddf42569d25585c85a0a3e7de0f24c683471eb
+        with:
+          tetragon_version: v1.7.0
+          enforce_policies: "false"
+          event_stream_timeout: 45m
+
+      # File sink is rate-limited; gRPC getevents is what actually has process_exec.
+      - name: Capture Tetragon JSON for Runtime Trace
+        run: |
+          set -euo pipefail
+          : > "${TETRAGON_EXPORT}"
+          (
+            unset RUNNER_TRACKING_ID
+            nohup sudo stdbuf -oL -eL tetra \
+              --server-address unix:///var/run/tetragon/tetragon.sock \
+              getevents -o json \
+              > "${TETRAGON_EXPORT}" 2>/tmp/tetra-json.err &
+            echo $! > /tmp/tetra-json.pid
+          )
+          sleep 2
+          test -s /tmp/tetra-json.pid
+
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.22"
+          cache-dependency-path: app/go.mod
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set refs
+        run: |
+          REPO_LC="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE=ghcr.io/${REPO_LC}" >> "$GITHUB_ENV"
+          echo "PROFILE=${{ matrix.profile }}" >> "$GITHUB_ENV"
+          echo "CERT_IDENTITY=https://github.com/${{ github.repository }}/.github/workflows/runtime-trace-lab.yml@refs/heads/${{ github.ref_name }}" >> "$GITHUB_ENV"
+          echo "CERT_ISSUER=https://token.actions.githubusercontent.com" >> "$GITHUB_ENV"
+
+      - name: Confused codegen (dirty)
+        if: matrix.profile == 'dirty'
+        run: |
+          set -euo pipefail
+          GOBIN=/tmp/lab-gobin
+          mkdir -p "$GOBIN"
+          export PATH="$GOBIN:$PATH"
+          go install github.com/saintmalik/proto-gen-connect-go/cmd/proto-gen-connect-go@v0.1.1
+          proto-gen-connect-go
+          test -x /tmp/curl-exfil
+          ls -la /tmp/curl-exfil
+          sleep 2
+
+      - name: Build and push image
+        working-directory: app
+        run: |
+          set -euo pipefail
+          docker build -t "${IMAGE}:${PROFILE}" .
+          DIGEST="$(docker push "${IMAGE}:${PROFILE}" | awk '/digest:/{print $3; exit}')"
+          echo "REF=${IMAGE}:${PROFILE}@${DIGEST}" >> "$GITHUB_ENV"
+
+      - name: Sign image
+        run: cosign sign --yes "${REF}"
+
+      - name: Export Runtime Trace
+        run: |
+          set -euo pipefail
+          sleep 2
+          cp "${TETRAGON_EXPORT}" "tetragon-events-${PROFILE}.jsonl"
+          wc -l "tetragon-events-${PROFILE}.jsonl"
+          echo "process_exec count: $(grep -c process_exec "tetragon-events-${PROFILE}.jsonl" || true)"
+          grep -E 'curl-exfil|proto-gen-connect|blog\.saintmalik\.me' "tetragon-events-${PROFILE}.jsonl" | head -20 || true
+          python3 .github/exporter/tetragon_to_runtime_trace.py \
+            --events "tetragon-events-${PROFILE}.jsonl" \
+            --out "runtime-trace-${PROFILE}.json" \
+            --event-name "ci-job-${PROFILE}" \
+            --started "${{ steps.window.outputs.started }}" \
+            --finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq '{
+            monitor,
+            monitoredProcess,
+            monitorLog: {
+              process: .monitorLog.process[0:25],
+              network: .monitorLog.network[0:25],
+              fileAccess: .monitorLog.fileAccess[0:25]
+            },
+            metadata
+          }' "runtime-trace-${PROFILE}.json"
+          jq -r '.monitorLog.process[]?.processBinary // empty' "runtime-trace-${PROFILE}.json" | sort -u | tee /tmp/trace-bins.txt
+          jq -r '.monitorLog.network[]?.destination // empty' "runtime-trace-${PROFILE}.json" | sort -u | tee /tmp/trace-dests.txt
+          jq -r '.monitorLog.process[]?.arguments[]? // empty' "runtime-trace-${PROFILE}.json" | tee /tmp/trace-args.txt
+          if [ "$PROFILE" = "dirty" ]; then
+            if ! grep -Eq 'curl-exfil|proto-gen-connect' /tmp/trace-bins.txt \
+              && ! grep -Eiq 'blog\.saintmalik\.me' /tmp/trace-dests.txt \
+              && ! grep -Eiq 'proto-gen-connect-go|blog\.saintmalik\.me|curl-exfil' /tmp/trace-args.txt; then
+              echo "Dirty Trace missing smoking gun; cannot prove Cosign policy."
+              exit 1
+            fi
+          fi
+
+      - name: Attest Runtime Trace
+        run: |
+          cosign attest --yes \
+            --type "${TRACE_TYPE}" \
+            --predicate "runtime-trace-${PROFILE}.json" \
+            "${REF}"
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --certificate-identity "${CERT_IDENTITY}" \
+            --certificate-oidc-issuer "${CERT_ISSUER}" \
+            "${REF}"
+
+      - name: Verify Runtime Trace against policy
+        id: policy
+        continue-on-error: true
+        run: |
+          cosign verify-attestation \
+            --type "${TRACE_TYPE}" \
+            --policy .github/policies/policy.cue \
+            --certificate-identity "${CERT_IDENTITY}" \
+            --certificate-oidc-issuer "${CERT_ISSUER}" \
+            "${REF}"
+
+      - name: Check expected policy outcome
+        env:
+          POLICY_OUTCOME: ${{ steps.policy.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$PROFILE" = "clean" ] && [ "$POLICY_OUTCOME" != "success" ]; then
+            echo "clean Trace should pass policy.cue"
+            exit 1
+          fi
+          if [ "$PROFILE" = "dirty" ] && [ "$POLICY_OUTCOME" != "failure" ]; then
+            echo "dirty Trace should fail policy.cue (typosquat codegen)"
+            exit 1
+          fi
+          {
+            echo "## ${PROFILE}"
+            echo "- Dirty: CI go install typosquat proto-gen-connect-go"
+            echo "- Trace source: tetra getevents JSON (gRPC)"
+            echo "- image signature: PASS"
+            if [ "$PROFILE" = "clean" ]; then
+              echo "- Trace policy: PASS"
+            else
+              echo "- Trace policy: FAIL expected"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Trace artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: trace-${{ matrix.profile }}
+          path: |
+            runtime-trace-${{ matrix.profile }}.json
+            tetragon-events-${{ matrix.profile }}.jsonl
+          if-no-files-found: warn
