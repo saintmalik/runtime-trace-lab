@@ -1,6 +1,6 @@
 # runtime-trace-lab
 
-Companion lab for [Cosign said yes. The build already lied.](https://blog.saintmalik.me/cosign-is-not-a-process-log/)
+Companion lab for [The image was signed. The process still lied.](https://blog.saintmalik.me/cosign-is-not-a-process-log/)
 
 Prove Cosign **image signature PASS** + **Runtime Trace policy PASS/FAIL**.
 
